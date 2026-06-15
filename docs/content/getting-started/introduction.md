@@ -4,11 +4,19 @@ description: "What lemmy is and how it is put together."
 weight: 10
 ---
 
-A command line for lemmy.
+A command line for the Lemmy federated forum.
 
-lemmy is a single binary. It speaks to lemmy over plain HTTPS,
+lemmy is a single binary. It speaks to lemmy.world over plain HTTPS,
 shapes the responses into clean records, and gets out of your way. There is
-nothing to sign up for and nothing to run alongside it.
+no API key, nothing to sign up for, and nothing to run alongside it.
+
+## What it can do
+
+- **`lemmy posts`** — list posts from lemmy.world, sorted by activity, heat, or newness
+- **`lemmy communities`** — list communities by subscriber count or activity
+- **`lemmy comments <post-id>`** — list comments on a post
+- **`lemmy search <query>`** — search posts across the instance
+- **`lemmy site`** — show instance statistics: users, posts, comments, communities
 
 ## How it is built
 
@@ -22,23 +30,9 @@ nothing to sign up for and nothing to run alongside it.
 - A thin **`cmd/lemmy`** hands the assembled app to `kit.Run`, which
   builds the command tree and the serve and mcp surfaces.
 
-## One operation, four surfaces
-
-Because an operation is surface-neutral, the same `page` you run on the command
-line is also a route and a tool:
-
-```bash
-lemmy page <path>                  # the command
-lemmy serve --addr :7777           # GET /v1/page/<path>
-lemmy mcp                          # the page tool, over stdio
-ant get lemmy://page/<path>        # the URI dereference (via a host)
-```
-
-You write the fetch and the record shape; the surfaces come for free.
-
 ## Scope
 
-lemmy is a read-only client over data lemmy already serves
+lemmy is a read-only client over data Lemmy already serves
 publicly. It reads that data and shapes it for you. That narrow scope keeps it a
 single small binary with no database, no daemon, and no setup.
 
