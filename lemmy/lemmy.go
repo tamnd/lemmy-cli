@@ -1,70 +1,411 @@
 // Package lemmy is the library behind the lemmy command line:
-// the HTTP client, request shaping, and the typed data models for lemmy.
+// the HTTP client, request shaping, and the typed data models for the
+// Lemmy federated forum API at lemmy.world.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Lemmy REST API is open for public read-only data: no API key, no auth
+// required. This package wraps the v3 API with a rate-limited client that the
+// kit operations consume.
 package lemmy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"strconv"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to lemmy. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "lemmy/dev (+https://github.com/tamnd/lemmy-cli)"
+// Host is the default Lemmy instance this client talks to.
+const Host = "lemmy.world"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at lemmy.com; change it once you
-// know the real endpoints you want to read.
-const Host = "lemmy.com"
+const defaultBaseURL = "https://lemmy.world/api/v3"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// DefaultUserAgent identifies the client to lemmy.world honestly.
+const DefaultUserAgent = "lemmy-cli/0.1 (tamnd87@gmail.com)"
 
-// Client talks to lemmy over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds constructor parameters for Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults for lemmy.world.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   defaultBaseURL,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client is a rate-limited HTTP client for the Lemmy v3 API.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// --- output types ---
+
+// Post is a single Lemmy post record.
+type Post struct {
+	ID        int    `json:"id" kit:"id"`
+	Title     string `json:"title"`
+	URL       string `json:"url"`
+	Body      string `json:"body"`
+	Community string `json:"community"`
+	Author    string `json:"author"`
+	Score     int    `json:"score"`
+	Comments  int    `json:"comments"`
+	Published string `json:"published"`
+	NSFW      bool   `json:"nsfw"`
+	PostURL   string `json:"post_url"`
+}
+
+// Community is a single Lemmy community record.
+type Community struct {
+	ID          int    `json:"id" kit:"id"`
+	Name        string `json:"name"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	ActorID     string `json:"actor_id"`
+	Subscribers int    `json:"subscribers"`
+	Posts       int    `json:"posts"`
+	Comments    int    `json:"comments"`
+	Published   string `json:"published"`
+}
+
+// Comment is a single Lemmy comment record.
+type Comment struct {
+	ID        int    `json:"id" kit:"id"`
+	Content   string `json:"content"`
+	Author    string `json:"author"`
+	Score     int    `json:"score"`
+	Published string `json:"published"`
+	PostID    int    `json:"post_id"`
+}
+
+// Site is instance-level statistics for a Lemmy instance.
+type Site struct {
+	Name        string `json:"name" kit:"id"`
+	Description string `json:"description"`
+	Version     string `json:"version"`
+	Users       int    `json:"users"`
+	Posts       int    `json:"posts"`
+	Comments    int    `json:"comments"`
+	Communities int    `json:"communities"`
+}
+
+// --- wire types (full nested JSON from Lemmy API) ---
+
+type wirePost struct {
+	Post struct {
+		ID        int    `json:"id"`
+		Name      string `json:"name"`
+		Body      string `json:"body"`
+		URL       string `json:"url"`
+		ApID      string `json:"ap_id"`
+		Published string `json:"published"`
+		NSFW      bool   `json:"nsfw"`
+	} `json:"post"`
+	Community struct {
+		Name  string `json:"name"`
+		Title string `json:"title"`
+	} `json:"community"`
+	Creator struct {
+		Name        string `json:"name"`
+		DisplayName string `json:"display_name"`
+	} `json:"creator"`
+	Counts struct {
+		Score    int `json:"score"`
+		Comments int `json:"comments"`
+	} `json:"counts"`
+}
+
+type wireCommunity struct {
+	Community struct {
+		ID          int    `json:"id"`
+		Name        string `json:"name"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		ActorID     string `json:"actor_id"`
+		Published   string `json:"published"`
+	} `json:"community"`
+	Counts struct {
+		Subscribers int `json:"subscribers"`
+		Posts       int `json:"posts"`
+		Comments    int `json:"comments"`
+	} `json:"counts"`
+}
+
+type wireComment struct {
+	Comment struct {
+		ID        int    `json:"id"`
+		Content   string `json:"content"`
+		Published string `json:"published"`
+		PostID    int    `json:"post_id"`
+	} `json:"comment"`
+	Creator struct {
+		Name        string `json:"name"`
+		DisplayName string `json:"display_name"`
+	} `json:"creator"`
+	Counts struct {
+		Score int `json:"score"`
+	} `json:"counts"`
+}
+
+type wirePostsResp struct {
+	Posts []wirePost `json:"posts"`
+}
+
+type wireCommunityListResp struct {
+	Communities []wireCommunity `json:"communities"`
+}
+
+type wireCommentsResp struct {
+	Comments []wireComment `json:"comments"`
+}
+
+type wireSearchResp struct {
+	Posts       []wirePost      `json:"posts"`
+	Communities []wireCommunity `json:"communities"`
+	Comments    []wireComment   `json:"comments"`
+}
+
+type wireSiteResp struct {
+	SiteView struct {
+		Site struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"site"`
+		Counts struct {
+			Users       int `json:"users"`
+			Posts       int `json:"posts"`
+			Comments    int `json:"comments"`
+			Communities int `json:"communities"`
+		} `json:"counts"`
+	} `json:"site_view"`
+	Version string `json:"version"`
+}
+
+// --- converters ---
+
+func toPost(w wirePost) Post {
+	author := w.Creator.Name
+	if w.Creator.DisplayName != "" {
+		author = w.Creator.DisplayName
+	}
+	return Post{
+		ID:        w.Post.ID,
+		Title:     w.Post.Name,
+		URL:       w.Post.URL,
+		Body:      w.Post.Body,
+		Community: w.Community.Name,
+		Author:    author,
+		Score:     w.Counts.Score,
+		Comments:  w.Counts.Comments,
+		Published: w.Post.Published,
+		NSFW:      w.Post.NSFW,
+		PostURL:   w.Post.ApID,
+	}
+}
+
+func toCommunity(w wireCommunity) Community {
+	return Community{
+		ID:          w.Community.ID,
+		Name:        w.Community.Name,
+		Title:       w.Community.Title,
+		Description: w.Community.Description,
+		ActorID:     w.Community.ActorID,
+		Subscribers: w.Counts.Subscribers,
+		Posts:       w.Counts.Posts,
+		Comments:    w.Counts.Comments,
+		Published:   w.Community.Published,
+	}
+}
+
+func toComment(w wireComment) Comment {
+	author := w.Creator.Name
+	if w.Creator.DisplayName != "" {
+		author = w.Creator.DisplayName
+	}
+	return Comment{
+		ID:        w.Comment.ID,
+		Content:   w.Comment.Content,
+		Author:    author,
+		Score:     w.Counts.Score,
+		Published: w.Comment.Published,
+		PostID:    w.Comment.PostID,
+	}
+}
+
+// --- API methods ---
+
+// ListPosts fetches posts from the Lemmy API.
+// sort: Active, Hot, New, TopDay, TopWeek, TopMonth (default: Active)
+// listType: All, Local, Subscribed (default: All)
+func (c *Client) ListPosts(ctx context.Context, sort, listType string, limit int) ([]Post, error) {
+	if sort == "" {
+		sort = "Active"
+	}
+	if listType == "" {
+		listType = "All"
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	q := url.Values{}
+	q.Set("sort", sort)
+	q.Set("type_", listType)
+	q.Set("limit", strconv.Itoa(limit))
+
+	var resp wirePostsResp
+	if err := c.getJSON(ctx, c.cfg.BaseURL+"/post/list?"+q.Encode(), &resp); err != nil {
+		return nil, err
+	}
+	out := make([]Post, len(resp.Posts))
+	for i, w := range resp.Posts {
+		out[i] = toPost(w)
+	}
+	return out, nil
+}
+
+// ListCommunities fetches communities from the Lemmy API.
+// sort: Active, Hot, New, TopDay, TopMonth, TopYear, TopAll (default: Active)
+// listType: All, Local (default: All)
+func (c *Client) ListCommunities(ctx context.Context, sort, listType string, limit int) ([]Community, error) {
+	if sort == "" {
+		sort = "Active"
+	}
+	if listType == "" {
+		listType = "All"
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	q := url.Values{}
+	q.Set("sort", sort)
+	q.Set("type_", listType)
+	q.Set("limit", strconv.Itoa(limit))
+
+	var resp wireCommunityListResp
+	if err := c.getJSON(ctx, c.cfg.BaseURL+"/community/list?"+q.Encode(), &resp); err != nil {
+		return nil, err
+	}
+	out := make([]Community, len(resp.Communities))
+	for i, w := range resp.Communities {
+		out[i] = toCommunity(w)
+	}
+	return out, nil
+}
+
+// ListComments fetches comments on a post.
+func (c *Client) ListComments(ctx context.Context, postID, limit int) ([]Comment, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	q := url.Values{}
+	q.Set("post_id", strconv.Itoa(postID))
+	q.Set("limit", strconv.Itoa(limit))
+
+	var resp wireCommentsResp
+	if err := c.getJSON(ctx, c.cfg.BaseURL+"/comment/list?"+q.Encode(), &resp); err != nil {
+		return nil, err
+	}
+	out := make([]Comment, len(resp.Comments))
+	for i, w := range resp.Comments {
+		out[i] = toComment(w)
+	}
+	return out, nil
+}
+
+// Search searches for posts, communities, or comments.
+// searchType: Posts, Communities, Comments, Users (default: Posts)
+// sort: Active, Hot, New, TopAll (default: TopAll)
+func (c *Client) Search(ctx context.Context, query, searchType, sort string, limit int) (*wireSearchResp, error) {
+	if searchType == "" {
+		searchType = "Posts"
+	}
+	if sort == "" {
+		sort = "TopAll"
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	q := url.Values{}
+	q.Set("q", query)
+	q.Set("type_", searchType)
+	q.Set("sort", sort)
+	q.Set("limit", strconv.Itoa(limit))
+
+	var resp wireSearchResp
+	if err := c.getJSON(ctx, c.cfg.BaseURL+"/search?"+q.Encode(), &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetSite fetches instance statistics.
+func (c *Client) GetSite(ctx context.Context) (*Site, error) {
+	var resp wireSiteResp
+	if err := c.getJSON(ctx, c.cfg.BaseURL+"/site", &resp); err != nil {
+		return nil, err
+	}
+	return &Site{
+		Name:        resp.SiteView.Site.Name,
+		Description: resp.SiteView.Site.Description,
+		Version:     resp.Version,
+		Users:       resp.SiteView.Counts.Users,
+		Posts:       resp.SiteView.Counts.Posts,
+		Comments:    resp.SiteView.Counts.Comments,
+		Communities: resp.SiteView.Counts.Communities,
+	}, nil
+}
+
+// --- HTTP helpers ---
+
+func (c *Client) getJSON(ctx context.Context, rawURL string, v any) error {
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		return fmt.Errorf("decode %s: %w", rawURL, err)
+	}
+	return nil
+}
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
+			wait := time.Duration(attempt) * 500 * time.Millisecond
+			if wait > 5*time.Second {
+				wait = 5 * time.Second
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
+			case <-time.After(wait):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +414,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -96,105 +438,20 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// pace blocks until at least Rate has passed since the last request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
-}
-
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on lemmy.com. It is a stand-in for the typed records you
-// will model from the real lemmy endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `lemmy cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
